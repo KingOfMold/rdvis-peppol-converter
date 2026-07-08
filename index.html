@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="lv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RDVIS → PEPPOL BIS Billing 3.0 konvertors</title>
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 900px; margin: 40px auto; padding: 0 18px; line-height: 1.45; }
+    h1 { font-size: 28px; margin-bottom: 8px; }
+    .box { border: 1px solid #d9d9d9; border-radius: 12px; padding: 18px; margin: 18px 0; }
+    input[type="file"] { display: block; margin: 12px 0; }
+    button, .download { display: inline-block; border: 0; border-radius: 8px; padding: 10px 14px; margin: 6px 8px 6px 0; background: #222; color: #fff; text-decoration: none; cursor: pointer; font-size: 14px; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .muted { color: #666; }
+    .ok { color: #0a7a2f; font-weight: 600; }
+    .warn { color: #a15a00; font-weight: 600; }
+    .err { color: #b00020; font-weight: 600; white-space: pre-wrap; }
+    pre { background: #f6f6f6; border-radius: 10px; padding: 12px; overflow: auto; max-height: 420px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
+  </style>
+</head>
+<body>
+  <h1>RDVIS/eRiga XML → PEPPOL BIS Billing 3.0 XML</h1>
+  <p class="muted">Bezsaistes konvertors Rīgas domes <code>InvoiceImport</code> XML failiem. Fails netiek nekur augšupielādēts — pārvēršana notiek pārlūkā.</p>
+
+  <div class="box">
+    <label for="fileInput"><strong>1. Izvēlies vienu vai vairākus Rīgas domes XML failus</strong></label>
+    <input id="fileInput" type="file" accept=".xml,text/xml,application/xml" multiple>
+    <button id="convertBtn" disabled>Konvertēt</button>
+    <span id="status" class="muted"></span>
+  </div>
+
+  <div id="results"></div>
+
+<script>
+const NS_INV = "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2";
+const NS_CAC = "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2";
+const NS_CBC = "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2";
+
+const UNIT_MAP = {
+  "gab": "H87", "gab.": "H87", "pcs": "H87", "piece": "H87", "vienība": "H87", "vienibas": "H87", "vienības": "H87",
+  "st": "HUR", "h": "HUR", "hour": "HUR",
+  "diena": "DAY", "dienas": "DAY", "day": "DAY",
+  "mēn": "MON", "men": "MON", "month": "MON"
+};
+
+function localName(node) { return node.localName || node.nodeName.split(":").pop(); }
+function child(parent, name) {
+  if (!parent) return null;
+  for (const node of Array.from(parent.children || [])) {
+    if (localName(node) === name) return node;
+  }
+  return null;
+}
+function children(parent, name) {
+  if (!parent) return [];
+  return Array.from(parent.children || []).filter(n => localName(n) === name);
+}
+function findPath(parent, path) {
+  let node = parent;
+  for (const part of path.split("/")) {
+    node = child(node, part);
+    if (!node) return null;
+  }
+  return node;
+}
+function txt(parent, path, def = "") {
+  const node = findPath(parent, path);
+  return node && node.textContent != null ? node.textContent.trim() : def;
+}
+function money(v) {
+  const raw = (v == null || String(v).trim() === "") ? "0" : String(v).trim().replace(/\s/g, "").replace(",", ".");
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+function moneyText(v) { return money(v).toFixed(2); }
+function percentText(v) {
+  const n = Number(String(v || "0").replace(",", "."));
+  return Number.isInteger(n) ? String(n) : String(n);
+}
+function unitCode(v) { return UNIT_MAP[String(v || "").trim().toLowerCase()] || "H87"; }
+function taxCategoryId(rate, doesntApply) {
+  const da = String(doesntApply || "NO").trim().toUpperCase();
+  if (["YES", "TRUE", "1"].includes(da)) return "O";
+  if (Number(String(rate || "0").replace(",", ".")) === 0) return "Z";
+  return "S";
+}
+function safeFileName(v) {
+  const s = String(v || "invoice").trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^[-._]+|[-._]+$/g, "");
+  return s || "invoice";
+}
+function parseAddress(address) {
+  const parts = String(address || "").split(",").map(p => p.trim()).filter(Boolean);
+  const out = { street: parts[0] || "", city: "", additional: "", postal: "", subentity: "" };
+  for (const part of parts.slice(1)) {
+    const low = part.toLowerCase();
+    const post = part.match(/LV-?\d{4}/i);
+    if (post) out.postal = post[0].toUpperCase().replace(/^LV-?/, "LV-");
+    else if (low.includes("pag.") || low.includes("pagasts")) out.additional = part;
+    else if (low.includes("nov.") || low.includes("novads")) out.subentity = part;
+    else if (!out.city) out.city = part;
+    else if (!out.additional) out.additional = part;
+    else if (!out.subentity) out.subentity = part;
+  }
+  return out;
+}
+
+function add(doc, parent, ns, qname, textValue, attrs = {}) {
+  const el = doc.createElementNS(ns, qname);
+  if (textValue !== undefined && textValue !== null) el.textContent = String(textValue);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  parent.appendChild(el);
+  return el;
+}
+function addTaxCategory(doc, parent, rate, doesntApply) {
+  add(doc, parent, NS_CBC, "cbc:ID", taxCategoryId(rate, doesntApply));
+  add(doc, parent, NS_CBC, "cbc:Percent", percentText(rate));
+  const scheme = add(doc, parent, NS_CAC, "cac:TaxScheme");
+  add(doc, scheme, NS_CBC, "cbc:ID", "VAT");
+}
+function addParty(doc, parent, roleTag, partyNode) {
+  const role = add(doc, parent, NS_CAC, "cac:" + roleTag);
+  const party = add(doc, role, NS_CAC, "cac:Party");
+  const name = txt(partyNode, "Name");
+  const legalId = txt(partyNode, "LegalId");
+  const vatId = txt(partyNode, "VatId");
+  const country = txt(partyNode, "CountryCode", "LV") || "LV";
+  const addr = parseAddress(txt(partyNode, "Address"));
+
+  if (legalId) {
+    add(doc, party, NS_CBC, "cbc:EndpointID", legalId, { schemeID: "0218" });
+    const pid = add(doc, party, NS_CAC, "cac:PartyIdentification");
+    add(doc, pid, NS_CBC, "cbc:ID", legalId, { schemeID: "0218" });
+  }
+  const partyName = add(doc, party, NS_CAC, "cac:PartyName");
+  add(doc, partyName, NS_CBC, "cbc:Name", name);
+
+  const postal = add(doc, party, NS_CAC, "cac:PostalAddress");
+  if (addr.street) add(doc, postal, NS_CBC, "cbc:StreetName", addr.street);
+  if (addr.additional) add(doc, postal, NS_CBC, "cbc:AdditionalStreetName", addr.additional);
+  if (addr.city) add(doc, postal, NS_CBC, "cbc:CityName", addr.city);
+  if (addr.postal) add(doc, postal, NS_CBC, "cbc:PostalZone", addr.postal);
+  if (addr.subentity) add(doc, postal, NS_CBC, "cbc:CountrySubentity", addr.subentity);
+  const countryEl = add(doc, postal, NS_CAC, "cac:Country");
+  add(doc, countryEl, NS_CBC, "cbc:IdentificationCode", country);
+
+  if (vatId) {
+    const tax = add(doc, party, NS_CAC, "cac:PartyTaxScheme");
+    add(doc, tax, NS_CBC, "cbc:CompanyID", vatId);
+    const scheme = add(doc, tax, NS_CAC, "cac:TaxScheme");
+    add(doc, scheme, NS_CBC, "cbc:ID", "VAT");
+  }
+
+  const legal = add(doc, party, NS_CAC, "cac:PartyLegalEntity");
+  add(doc, legal, NS_CBC, "cbc:RegistrationName", name);
+  if (legalId) add(doc, legal, NS_CBC, "cbc:CompanyID", legalId, { schemeID: "0218" });
+}
+function buildNote(invoiceSet) {
+  const ben = child(invoiceSet, "BenSet");
+  const parts = [];
+  const benName = txt(ben, "Name");
+  const dept = txt(ben, "DepartmentId");
+  const agreementNo = txt(invoiceSet, "AgreementNo");
+  if (benName) parts.push("Saņēmējs: " + benName);
+  if (dept) parts.push("struktūrvienības kods: " + dept);
+  if (agreementNo) parts.push("līgums: " + agreementNo);
+  return parts.join("; ");
+}
+function convertInvoiceSet(invoiceSet) {
+  const doc = document.implementation.createDocument(NS_INV, "Invoice", null);
+  const root = doc.documentElement;
+  root.setAttribute("xmlns:cac", NS_CAC);
+  root.setAttribute("xmlns:cbc", NS_CBC);
+
+  const supplier = child(invoiceSet, "SupplierSet");
+  const customer = child(invoiceSet, "CustomerSet");
+  const beneficiary = child(invoiceSet, "BenSet");
+  const sums = child(invoiceSet, "DocSumsSet");
+  const docNo = txt(invoiceSet, "DocNo");
+  const docDate = txt(invoiceSet, "DocDate");
+  const dueDate = txt(invoiceSet, "PaymDeadline");
+  const currency = txt(sums, "DocCy", "EUR") || "EUR";
+  const buyerRef = txt(beneficiary, "DepartmentId") || txt(customer, "LegalId") || "NA";
+
+  add(doc, root, NS_CBC, "cbc:CustomizationID", "urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0");
+  add(doc, root, NS_CBC, "cbc:ProfileID", "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0");
+  add(doc, root, NS_CBC, "cbc:ID", docNo);
+  add(doc, root, NS_CBC, "cbc:IssueDate", docDate);
+  if (dueDate) add(doc, root, NS_CBC, "cbc:DueDate", dueDate);
+  add(doc, root, NS_CBC, "cbc:InvoiceTypeCode", "380");
+  const note = buildNote(invoiceSet);
+  if (note) add(doc, root, NS_CBC, "cbc:Note", note);
+  add(doc, root, NS_CBC, "cbc:DocumentCurrencyCode", currency);
+  add(doc, root, NS_CBC, "cbc:BuyerReference", buyerRef);
+
+  const agreementNo = txt(invoiceSet, "AgreementNo");
+  const agreementDate = txt(invoiceSet, "AgreementDate");
+  if (agreementNo) {
+    const contract = add(doc, root, NS_CAC, "cac:ContractDocumentReference");
+    add(doc, contract, NS_CBC, "cbc:ID", agreementNo);
+    if (agreementDate) add(doc, contract, NS_CBC, "cbc:IssueDate", agreementDate);
+  }
+
+  if (supplier) addParty(doc, root, "AccountingSupplierParty", supplier);
+  if (customer) addParty(doc, root, "AccountingCustomerParty", customer);
+
+  const supplierAcc = supplier ? child(supplier, "AccSet") : null;
+  if (supplierAcc) {
+    const means = add(doc, root, NS_CAC, "cac:PaymentMeans");
+    add(doc, means, NS_CBC, "cbc:PaymentMeansCode", "30", { name: "Credit transfer" });
+    add(doc, means, NS_CBC, "cbc:PaymentID", docNo);
+    const account = add(doc, means, NS_CAC, "cac:PayeeFinancialAccount");
+    add(doc, account, NS_CBC, "cbc:ID", txt(supplierAcc, "AccNo"));
+    add(doc, account, NS_CBC, "cbc:Name", txt(supplier, "Name"));
+    const bic = txt(supplierAcc, "BCode");
+    if (bic) {
+      const branch = add(doc, account, NS_CAC, "cac:FinancialInstitutionBranch");
+      add(doc, branch, NS_CBC, "cbc:ID", bic);
+    }
+  }
+
+  if (dueDate) {
+    const terms = add(doc, root, NS_CAC, "cac:PaymentTerms");
+    add(doc, terms, NS_CBC, "cbc:Note", "Apmaksa līdz " + dueDate);
+  }
+
+  const vatSets = children(sums, "VatSumSet");
+  let totalVat = 0;
+  for (const vat of vatSets) totalVat += money(txt(vat, "VatSum", "0"));
+  const taxTotal = add(doc, root, NS_CAC, "cac:TaxTotal");
+  add(doc, taxTotal, NS_CBC, "cbc:TaxAmount", moneyText(totalVat), { currencyID: currency });
+  for (const vat of vatSets) {
+    const subtotal = add(doc, taxTotal, NS_CAC, "cac:TaxSubtotal");
+    add(doc, subtotal, NS_CBC, "cbc:TaxableAmount", moneyText(txt(vat, "SumWoVat", "0")), { currencyID: currency });
+    add(doc, subtotal, NS_CBC, "cbc:TaxAmount", moneyText(txt(vat, "VatSum", "0")), { currencyID: currency });
+    const category = add(doc, subtotal, NS_CAC, "cac:TaxCategory");
+    addTaxCategory(doc, category, txt(vat, "VatRate", "0"), txt(vat, "VatDoesntApply", "NO"));
+  }
+
+  let sumWoVat = 0;
+  for (const vat of vatSets) sumWoVat += money(txt(vat, "SumWoVat", "0"));
+  const sumToPay = money(txt(sums, "SumToPay", String(sumWoVat + totalVat)));
+  const monetary = add(doc, root, NS_CAC, "cac:LegalMonetaryTotal");
+  add(doc, monetary, NS_CBC, "cbc:LineExtensionAmount", moneyText(sumWoVat), { currencyID: currency });
+  add(doc, monetary, NS_CBC, "cbc:TaxExclusiveAmount", moneyText(sumWoVat), { currencyID: currency });
+  add(doc, monetary, NS_CBC, "cbc:TaxInclusiveAmount", moneyText(sumToPay), { currencyID: currency });
+  add(doc, monetary, NS_CBC, "cbc:PayableAmount", moneyText(sumToPay), { currencyID: currency });
+
+  for (const row of children(invoiceSet, "DocRowSet")) {
+    const rowSums = child(row, "DocRowSumsSet");
+    const line = add(doc, root, NS_CAC, "cac:InvoiceLine");
+    const measurement = txt(rowSums, "Measurement", "gab");
+    add(doc, line, NS_CBC, "cbc:ID", txt(row, "RowNo", "1"));
+    add(doc, line, NS_CBC, "cbc:InvoicedQuantity", txt(rowSums, "Amount", "1"), { unitCode: unitCode(measurement) });
+    add(doc, line, NS_CBC, "cbc:LineExtensionAmount", moneyText(txt(rowSums, "RowSum", "0")), { currencyID: currency });
+
+    const item = add(doc, line, NS_CAC, "cac:Item");
+    add(doc, item, NS_CBC, "cbc:Name", txt(row, "NomName"));
+    const rowVat = child(rowSums, "VatSumSet");
+    const cls = add(doc, item, NS_CAC, "cac:ClassifiedTaxCategory");
+    addTaxCategory(doc, cls, txt(rowVat, "VatRate", "0"), txt(rowVat, "VatDoesntApply", "NO"));
+
+    const price = add(doc, line, NS_CAC, "cac:Price");
+    add(doc, price, NS_CBC, "cbc:PriceAmount", moneyText(txt(rowSums, "Price", "0")), { currencyID: currency });
+    add(doc, price, NS_CBC, "cbc:BaseQuantity", "1", { unitCode: unitCode(measurement) });
+  }
+
+  const summary = {
+    docNo, docDate, dueDate, currency,
+    supplier: txt(supplier, "Name"), customer: txt(customer, "Name"),
+    rows: children(invoiceSet, "DocRowSet").length,
+    sumWoVat: moneyText(sumWoVat), totalVat: moneyText(totalVat), sumToPay: moneyText(sumToPay),
+    warnings: []
+  };
+  const rowTotal = children(invoiceSet, "DocRowSet").reduce((s, row) => s + money(txt(child(row, "DocRowSumsSet"), "RowSum", "0")), 0);
+  if (moneyText(rowTotal) !== moneyText(sumWoVat)) summary.warnings.push("Rindu summa nesakrīt ar dokumenta summu bez PVN.");
+  for (const row of children(invoiceSet, "DocRowSet")) {
+    const m = txt(child(row, "DocRowSumsSet"), "Measurement", "gab");
+    if (!UNIT_MAP[String(m || "").trim().toLowerCase()]) summary.warnings.push("Nezināma mērvienība “" + m + "”; izmantots H87.");
+  }
+
+  return { xml: serializePretty(doc), fileName: "peppol_bis3_ubl_invoice_" + safeFileName(docNo) + ".xml", summary };
+}
+function serializePretty(doc) {
+  let xml = new XMLSerializer().serializeToString(doc);
+  xml = xml.replace(/></g, ">\n<");
+  const lines = xml.split("\n");
+  let indent = 0;
+  const out = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>"];
+  for (let line of lines) {
+    if (line.startsWith("<?xml")) continue;
+    if (/^<\//.test(line)) indent = Math.max(indent - 1, 0);
+    out.push("  ".repeat(indent) + line);
+    if (/^<[^!?/][^>]*[^/]>(?!.*<\/)/.test(line)) indent += 1;
+  }
+  return out.join("\n");
+}
+function parseInputXml(text) {
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(text, "application/xml");
+  const err = xml.getElementsByTagName("parsererror")[0];
+  if (err) throw new Error("XML nav korekti parsējams. Pārbaudi, vai izvēlēts pareizais fails.");
+  const invoiceSets = Array.from(xml.getElementsByTagName("InvoiceSet"));
+  if (invoiceSets.length) return invoiceSets;
+  const all = Array.from(xml.getElementsByTagName("*"));
+  return all.filter(n => localName(n) === "InvoiceSet");
+}
+function downloadLink(name, xml) {
+  const blob = new Blob([xml], { type: "application/xml;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.className = "download";
+  a.textContent = "Lejupielādēt " + name;
+  return a;
+}
+
+const input = document.getElementById("fileInput");
+const button = document.getElementById("convertBtn");
+const status = document.getElementById("status");
+const results = document.getElementById("results");
+input.addEventListener("change", () => { button.disabled = input.files.length === 0; status.textContent = input.files.length ? input.files.length + " fails/faili izvēlēti" : ""; });
+button.addEventListener("click", async () => {
+  results.innerHTML = "";
+  for (const file of Array.from(input.files)) {
+    const box = document.createElement("div");
+    box.className = "box";
+    box.innerHTML = "<h2>" + file.name + "</h2>";
+    results.appendChild(box);
+    try {
+      const content = await file.text();
+      const invoiceSets = parseInputXml(content);
+      if (!invoiceSets.length) throw new Error("Nav atrasts InvoiceSet elements.");
+      invoiceSets.forEach((set, idx) => {
+        const converted = convertInvoiceSet(set);
+        if (invoiceSets.length > 1) converted.fileName = converted.fileName.replace(/\.xml$/, "-" + (idx + 1) + ".xml");
+        const p = document.createElement("p");
+        p.innerHTML = `<span class="ok">OK</span> Rēķins <strong>${converted.summary.docNo}</strong>; bez PVN ${converted.summary.sumWoVat} ${converted.summary.currency}; PVN ${converted.summary.totalVat}; apmaksai ${converted.summary.sumToPay}.`;
+        box.appendChild(p);
+        if (converted.summary.warnings.length) {
+          const w = document.createElement("p");
+          w.className = "warn";
+          w.textContent = converted.summary.warnings.join(" ");
+          box.appendChild(w);
+        }
+        box.appendChild(downloadLink(converted.fileName, converted.xml));
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = "Parādīt XML priekšskatījumu";
+        const pre = document.createElement("pre");
+        pre.textContent = converted.xml;
+        details.appendChild(summary);
+        details.appendChild(pre);
+        box.appendChild(details);
+      });
+    } catch (e) {
+      const err = document.createElement("p");
+      err.className = "err";
+      err.textContent = "Kļūda: " + e.message;
+      box.appendChild(err);
+    }
+  }
+});
+</script>
+</body>
+</html>
